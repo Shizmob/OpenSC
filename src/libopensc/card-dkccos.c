@@ -38,14 +38,19 @@ enum dkccos_instructions {
     DKCCOS_INS_RECYCLE = 0x44,
     DKCCOS_INS_END_SESSION = 0x48,
     DKCCOS_INS_GET_CHALLENGE = 0x4C,
+    DKCCOS_INS_DELETE = 0xE2,
 };
 
 enum dkccos_file_type {
     DKCCOS_FILE_NORMAL = 0x1,
     DKCCOS_FILE_INTERNAL = 0x9,
     DKCCOS_FILE_DIR = 0x38,
-    DKCCOS_FILE_PUBKEY = 0xF009,
-    DKCCOS_FILE_PRIVKEY = 0xF109,
+};
+
+enum dkccos_file_structure {
+    DKCCOS_STRUCTURE_NORMAL = 0,
+    DKCCOS_STRUCTURE_PUBKEY = 0xF0,
+    DKCCOS_STRUCTURE_PRIVKEY = 0xF1,
 };
 
 #define DKCCOS_PIN_MAX_LENGTH   20
@@ -64,10 +69,29 @@ static const struct sc_atr_table dkccos_atrs[] = {
 /* private data for dkccos driver */
 struct dkccos_private_data {
     unsigned int curr_file;
-    unsigned int curr_size;
 };
 
 static const struct sc_card_operations *iso_ops = NULL;
+
+static int dkccos_get_size(sc_card_t *card)
+{
+    int r = 0;
+    struct dkccos_private_data *priv;
+    sc_path_t path = { 0 };
+    sc_file_t *f = NULL;
+
+    priv = card->drv_data;
+    path.type = SC_PATH_TYPE_FILE_ID;
+    path.len = 2;
+    path.value[0] = (priv->curr_file >> 8) &0xff;
+    path.value[1] = (priv->curr_file) & 0xff;
+    r = sc_select_file(card, &path, &f);
+    LOG_TEST_RET(card->ctx, r, "refreshing file info failed");
+
+    r = f->size;
+    free(f);
+    return r;
+}
 
 
 
@@ -112,6 +136,12 @@ static int dkccos_finish(sc_card_t *card)
 }
 
 
+static int dkccos_update_binary(struct sc_card *card, unsigned int idx, const u8 *buf, size_t count, unsigned long flags)
+{
+    /* we don't do any updating around here, pal */
+    return sc_write_binary(card, idx, buf, count, flags);
+}
+
 /* yoinked from iso7816.c */
 static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_path, struct sc_file **file_out)
 {
@@ -124,7 +154,7 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
     struct dkccos_private_data *priv = NULL;
 
     if (card == NULL || in_path == NULL || in_path->aid.len) {
-        return SC_ERROR_INVALID_ARGUMENTS;
+        LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
     }
     memcpy(path, in_path->value, in_path->len);
     path_len = in_path->len;
@@ -132,14 +162,11 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
     sc_format_apdu(card, &apdu, SC_APDU_CASE_4_SHORT, 0xA4, 0, 0);
 
     switch (in_path->type) {
-    case SC_PATH_TYPE_FILE_ID:
-        apdu.p1 = 0;
-        if (path_len != 2)
-            return SC_ERROR_INVALID_ARGUMENTS;
-        break;
     case SC_PATH_TYPE_DF_NAME:
         apdu.p1 = 4;
         break;
+    case SC_PATH_TYPE_FILE_ID:
+        /* fallthrough, as card does not support p1 = 0 */
     case SC_PATH_TYPE_PATH:
         apdu.p1 = 8;
         if (path_len >= 2 && memcmp(path, "\x3F\x00", 2) == 0) {
@@ -175,7 +202,7 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
     if (r)
         LOG_FUNC_RETURN(card->ctx, r);
 
-    if (apdu.resplen < 2 || apdu.resp[0])
+    if (apdu.resplen < 2)
         LOG_FUNC_RETURN(card->ctx, SC_ERROR_UNKNOWN_DATA_RECEIVED);
 
     file = sc_file_new();
@@ -186,7 +213,6 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
 
     priv = card->drv_data;
     priv->curr_file = file->id;
-    priv->curr_size = file->size;
 
     if (file_out)
         *file_out = file;
@@ -194,6 +220,41 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
         free(file);
 
     return SC_SUCCESS;
+}
+
+/* yoinked from iso7816.c */
+static int dkccos_delete_file(struct sc_card *card, const sc_path_t *path)
+{
+	int r, p1, p2;
+	u8 sbuf[2];
+	struct sc_apdu apdu;
+    struct dkccos_private_data *priv = NULL;
+
+	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
+	if (path->type != SC_PATH_TYPE_FILE_ID || (path->len != 0 && path->len != 2)) {
+		sc_log(card->ctx, "File type has to be SC_PATH_TYPE_FILE_ID");
+		LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+	}
+
+	if (path->len == 2) {
+		p1 = path->value[0];
+		p2 = path->value[1];
+    } else {
+        priv = card->drv_data;
+        p1 = priv->curr_file >> 8;
+        p2 = priv->curr_file & 0xff;
+    }
+    sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, DKCCOS_INS_DELETE, p1, p2);
+    apdu.lc = 2;
+    apdu.datalen = 2;
+    apdu.data = sbuf;
+
+	r = sc_transmit_apdu(card, &apdu);
+	LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+	r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+	LOG_TEST_RET(card->ctx, r, "DELETE command failed");
+
+	return r;
 }
 
 /* yoinked from iso7816.c */
@@ -295,8 +356,9 @@ static int dkccos_construct_acl(struct sc_card *card, const sc_file_t *file, con
 static int dkccos_construct_fci(struct sc_card *card, const sc_file_t *file, u8 *out, size_t *outlen)
 {
     const sc_acl_entry_t *entry;
-    unsigned int type;
+    unsigned int type, structure;
 
+    structure = DKCCOS_STRUCTURE_NORMAL;
     switch (file->type) {
     case SC_FILE_TYPE_INTERNAL_EF:
         type = DKCCOS_FILE_INTERNAL;
@@ -316,8 +378,8 @@ static int dkccos_construct_fci(struct sc_card *card, const sc_file_t *file, u8 
     *p++ = file->size & 0xff;
     *p++ = file->id >> 8;
     *p++ = file->id & 0xff;
-    *p++ = type >> 8;
-    *p++ = type & 0xff;
+    *p++ = type;
+    *p++ = structure;
 
     entry = sc_file_get_acl_entry(file, SC_AC_OP_READ);
     if (entry)
@@ -357,26 +419,41 @@ static int dkccos_process_acl(struct sc_card *card, sc_file_t *file, unsigned in
 static int dkccos_process_fci(sc_card_t *card, sc_file_t *file, const u8 *data, size_t len)
 {
     int r = 0;
-    unsigned type;
-    
-    file->size = data[9] << 8 | data[10];
+
     file->id = data[2] << 8 | data[3];
 
-    type = data[5] << 8 | data[4];
-    switch (type) {
+    switch (data[4]) {
     case DKCCOS_FILE_INTERNAL:
         file->type = SC_FILE_TYPE_INTERNAL_EF;
-        file->ef_structure = SC_FILE_EF_TRANSPARENT;
         break;
     case DKCCOS_FILE_NORMAL:
         file->type = SC_FILE_TYPE_WORKING_EF;
-        file->ef_structure = SC_FILE_EF_TRANSPARENT;
         break;
     case DKCCOS_FILE_DIR:
         file->type = SC_FILE_TYPE_DF;
         break;
     default:
         LOG_TEST_RET(card->ctx, SC_ERROR_INCORRECT_PARAMETERS, "invalid file type");
+    }
+
+    if (file->type == SC_FILE_TYPE_DF) {
+        file->size = data[9] << 8 | data[10];
+    } else {
+        file->size = data[0] << 8 | data[1];
+    }
+
+    switch (data[5]) {
+    case DKCCOS_STRUCTURE_NORMAL:
+        file->ef_structure = SC_FILE_EF_TRANSPARENT;
+        break;
+    case DKCCOS_STRUCTURE_PUBKEY:
+        file->ef_structure = SC_FILE_EF_TRANSPARENT;
+        break;
+    case DKCCOS_STRUCTURE_PRIVKEY:
+        file->ef_structure = SC_FILE_EF_TRANSPARENT;
+        break;
+    default:
+        LOG_TEST_RET(card->ctx, SC_ERROR_INCORRECT_PARAMETERS, "invalid file structure");
     }
 
     r = dkccos_process_acl(card, file, SC_AC_OP_READ, data[6]);
@@ -413,13 +490,17 @@ static int dkccos_erase_card(sc_card_t *card)
 static int dkccos_list_files(sc_card_t *card, u8 *buf, size_t buflen)
 {
     int r = 0;
-    unsigned int idx = 0;
+    unsigned int idx = 0, size;
     u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
-    struct dkccos_private_data *priv = NULL;
 
-    priv = card->drv_data;
-    while (idx < priv->curr_size && buflen) {
-        r = card->ops->read_binary(card, idx, rbuf, sizeof(rbuf), 0);
+    /* refresh metadata */
+    r = dkccos_get_size(card);
+    if (r < 0)
+        return r;
+    size = r;
+
+    while (idx < size && buflen) {
+        r = sc_read_binary(card, idx, rbuf, sizeof(rbuf), 0);
         LOG_TEST_RET(card->ctx, r, "failed to read directory entry");
 
         *buf++ = rbuf[2];
@@ -428,7 +509,7 @@ static int dkccos_list_files(sc_card_t *card, u8 *buf, size_t buflen)
         idx++;
     }
 
-    if (idx < priv->curr_size)
+    if (idx < size)
         LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
     return idx * 2;
 }
@@ -464,7 +545,11 @@ static struct sc_card_driver *sc_get_driver(void)
     dkccos_ops.finish = dkccos_finish;
 
     /* ISO 7816-4 functions */
+    dkccos_ops.update_binary = dkccos_update_binary;
+    dkccos_ops.read_record = NULL;
+    dkccos_ops.write_record = NULL;
     dkccos_ops.append_record = NULL; /* conflicting */
+    dkccos_ops.update_record = NULL;
     dkccos_ops.select_file = dkccos_select_file;
     dkccos_ops.get_challenge = dkccos_get_challenge;
 
@@ -472,6 +557,8 @@ static struct sc_card_driver *sc_get_driver(void)
     dkccos_ops.logout = dkccos_logout;
 
     /* ISO 7816-9 functions */
+    dkccos_ops.delete_record = NULL;
+    dkccos_ops.delete_file = dkccos_delete_file;
     dkccos_ops.list_files = dkccos_list_files;
     dkccos_ops.card_ctl = dkccos_card_ctl;
     dkccos_ops.construct_fci = dkccos_construct_fci;

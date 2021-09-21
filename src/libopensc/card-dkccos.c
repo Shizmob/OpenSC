@@ -73,7 +73,7 @@ struct dkccos_private_data {
 
 static const struct sc_card_operations *iso_ops = NULL;
 
-static int dkccos_get_size(sc_card_t *card)
+static int dkccos_do_get_size(sc_card_t *card)
 {
     int r = 0;
     struct dkccos_private_data *priv;
@@ -332,7 +332,7 @@ static int dkccos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *data, int *tr
 static int dkccos_logout(sc_card_t *card)
 {
     int r = 0;
-    struct sc_apdu apdu;
+    sc_apdu_t apdu;
 
     sc_format_apdu(card, &apdu, SC_APDU_CASE_1, DKCCOS_INS_END_SESSION, 0x00, 0x00);
     r = sc_transmit_apdu(card, &apdu);
@@ -497,7 +497,7 @@ static int dkccos_list_files(sc_card_t *card, u8 *buf, size_t buflen)
     u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
 
     /* refresh metadata */
-    r = dkccos_get_size(card);
+    r = dkccos_do_get_size(card);
     if (r < 0)
         return r;
     size = r;

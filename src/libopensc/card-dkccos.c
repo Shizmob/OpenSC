@@ -310,12 +310,15 @@ static int dkccos_pin_cmd(sc_card_t *card, struct sc_pin_cmd_data *data, int *tr
     LOG_TEST_RET(card->ctx, r, "building pin APDU failed");
     data->apdu = &apdu;
 
+    /* DKCCOS puts the pin reference in P1 */
+    apdu.p1 = apdu.p2;
+    apdu.p2 = 0;
     switch (data->cmd) {
     case SC_PIN_CMD_CHANGE:
         apdu.ins = DKCCOS_INS_CHANGE_PIN;
+        apdu.p2 = 1;
         break;
     case SC_PIN_CMD_VERIFY:
-        apdu.p1 = apdu.p2;
         apdu.p2 = 0;
         break;
     }

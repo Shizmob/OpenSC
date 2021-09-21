@@ -33,11 +33,16 @@
 #include "cardctl.h"
 
 
-enum dkccos_instructions {
+enum dkccos_instruction {
     DKCCOS_INS_CHANGE_PIN = 0x1A,
     DKCCOS_INS_RECYCLE = 0x44,
     DKCCOS_INS_END_SESSION = 0x48,
+    DKCCOS_INS_FORMAT = 0x4A,
     DKCCOS_INS_GET_CHALLENGE = 0x4C,
+    DKCCOS_INS_GENERATE_KEYS = 0x4E,
+    DKCCOS_INS_DECRYPT = 0x54,
+    DKCCOS_INS_SIGN = 0x5A,
+    DKCCOS_INS_RESET = 0x86,
     DKCCOS_INS_DELETE = 0xE2,
 };
 
@@ -57,6 +62,17 @@ enum dkccos_file_structure {
 #define DKCCOS_PIN_ID_SO        1
 #define DKCCOS_PIN_ID_USER      2
 
+enum dkccos_cipher {
+    DKCCOS_CIPHER_DES_ECB = 0,
+    DKCCOS_CIPHER_RSA_PKCS1 = 1,
+    DKCCOS_CIPHER_RSA_RAW = 2,
+};
+
+enum dkccos_key_type {
+    DKCCOS_KEY_PUBLIC = 1,
+    DKCCOS_KEY_PRIVATE = 3,
+};
+
 
 static const struct sc_atr_table dkccos_atrs[] = {
     /* DKCCOS 6.0 */
@@ -69,6 +85,8 @@ static const struct sc_atr_table dkccos_atrs[] = {
 /* private data for dkccos driver */
 struct dkccos_private_data {
     unsigned int curr_file;
+    sc_security_env_t sec_env;
+    int sec_env_num;
 };
 
 static const struct sc_card_operations *iso_ops = NULL;
@@ -76,11 +94,10 @@ static const struct sc_card_operations *iso_ops = NULL;
 static int dkccos_do_get_size(sc_card_t *card)
 {
     int r = 0;
-    struct dkccos_private_data *priv;
+    struct dkccos_private_data *priv = card->drv_data;
     sc_path_t path = { 0 };
     sc_file_t *f = NULL;
 
-    priv = card->drv_data;
     path.type = SC_PATH_TYPE_FILE_ID;
     path.len = 2;
     path.value[0] = (priv->curr_file >> 8) &0xff;
@@ -93,6 +110,38 @@ static int dkccos_do_get_size(sc_card_t *card)
     return r;
 }
 
+static int dkccos_do_format_path(sc_card_t *card, u8 *buf, size_t buflen, sc_path_t *path)
+{
+    int i = 0;
+    if (buflen < 2)
+        return SC_ERROR_WRONG_LENGTH;
+
+    switch (path->type) {
+    case SC_PATH_TYPE_FILE_ID:
+    case SC_PATH_TYPE_PATH:
+        if (path->len <= 2) {
+            buf[i++] = 0x3F;
+            buf[i++] = 0;
+        }
+        if (buflen < path->len + i)
+            return SC_ERROR_WRONG_LENGTH;
+
+        memcpy(buf + i, path->value, path->len);
+        return path->len + i;
+    default:
+        return SC_ERROR_NOT_SUPPORTED;
+    }
+}
+
+static int dkccos_do_format_path_id(sc_card_t *card, u8 *buf, size_t buflen, unsigned int id)
+{
+    sc_path_t path;
+    path.type = SC_PATH_TYPE_FILE_ID;
+    path.len = 2;
+    path.value[0] = id >> 8;
+    path.value[1] = id & 0xff;
+    return dkccos_do_format_path(card, buf, buflen, &path);
+}
 
 
 static int dkccos_match_card(sc_card_t *card)
@@ -104,6 +153,8 @@ static int dkccos_match_card(sc_card_t *card)
 
 static int dkccos_init(sc_card_t *card)
 {
+    unsigned long flags = 0;
+
     LOG_FUNC_CALLED(card->ctx);
 
     struct dkccos_private_data *priv = NULL;
@@ -111,10 +162,21 @@ static int dkccos_init(sc_card_t *card)
     priv = calloc(1, sizeof(struct dkccos_private_data));
     if (!priv)
         LOG_FUNC_RETURN(card->ctx, SC_ERROR_OUT_OF_MEMORY);
+    priv->sec_env_num = -1;
     card->drv_data = priv;
 
     card->cla = 0x00;
     card->caps |= SC_CARD_CAP_RNG;
+
+    /* add RSA */
+    flags = SC_ALGORITHM_ONBOARD_KEY_GEN | SC_ALGORITHM_RSA_PAD_NONE | SC_ALGORITHM_RSA_PAD_PKCS1 | SC_ALGORITHM_RSA_HASH_NONE;
+    _sc_card_add_rsa_alg(card, 512,  flags, 0x10001);
+    _sc_card_add_rsa_alg(card, 768,  flags, 0x10001);
+    _sc_card_add_rsa_alg(card, 1024, flags, 0x10001);
+    _sc_card_add_rsa_alg(card, 2048, flags, 0x10001);
+    /* add DES */
+    flags = 0;
+    _sc_card_add_symmetric_alg(card, SC_ALGORITHM_DES, 64, flags);
 
     LOG_FUNC_RETURN(card->ctx, SC_SUCCESS);
 }
@@ -151,7 +213,7 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
     int r = 0;
     struct sc_file *file = NULL;
     size_t path_len;
-    struct dkccos_private_data *priv = NULL;
+    struct dkccos_private_data *priv = card->drv_data;
 
     if (card == NULL || in_path == NULL || in_path->aid.len) {
         LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
@@ -172,7 +234,7 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
         if (path_len >= 2 && memcmp(path, "\x3F\x00", 2) == 0) {
             path += 2;
             path_len -= 2;
-            if (!path_len) // only 3F00 supplied
+            if (!path_len) /* only 3F00 supplied */
                 apdu.cse = SC_APDU_CASE_2_SHORT;
         }
         break;
@@ -211,7 +273,6 @@ static int dkccos_select_file(struct sc_card *card, const struct sc_path *in_pat
     r = card->ops->process_fci(card, file, apdu.resp, apdu.resplen);
     LOG_TEST_RET(card->ctx, r, "processing FCI failed");
 
-    priv = card->drv_data;
     priv->curr_file = file->id;
 
     if (file_out)
@@ -228,7 +289,7 @@ static int dkccos_delete_file(struct sc_card *card, const sc_path_t *path)
 	int r, p1, p2;
 	u8 sbuf[2];
 	struct sc_apdu apdu;
-    struct dkccos_private_data *priv = NULL;
+    struct dkccos_private_data *priv = card->drv_data;
 
 	SC_FUNC_CALLED(card->ctx, SC_LOG_DEBUG_VERBOSE);
 	if (path->type != SC_PATH_TYPE_FILE_ID || (path->len != 0 && path->len != 2)) {
@@ -240,7 +301,6 @@ static int dkccos_delete_file(struct sc_card *card, const sc_path_t *path)
 		p1 = path->value[0];
 		p2 = path->value[1];
     } else {
-        priv = card->drv_data;
         p1 = priv->curr_file >> 8;
         p2 = priv->curr_file & 0xff;
     }
@@ -344,6 +404,109 @@ static int dkccos_logout(sc_card_t *card)
 }
 
 
+static int dkccos_set_security_env(sc_card_t *card, const sc_security_env_t *env, int se_num)
+{
+    struct dkccos_private_data *priv = card->drv_data;
+
+    if (priv->sec_env_num && se_num != priv->sec_env_num)
+        LOG_TEST_RET(card->ctx, SC_ERROR_NOT_SUPPORTED, "multiple security environments are not supported");
+
+    switch (env->operation) {
+    case SC_SEC_OPERATION_DECIPHER:
+    case SC_SEC_OPERATION_SIGN:
+        /* ok */
+        break;
+    default:
+        LOG_TEST_RET(card->ctx, SC_ERROR_NOT_SUPPORTED, "unsupported security operation");
+    }
+
+    if (!(env->flags & SC_SEC_ENV_FILE_REF_PRESENT))
+        LOG_TEST_RET(card->ctx, SC_ERROR_NOT_SUPPORTED, "only file references are supported");
+    if (!(env->flags & SC_SEC_ENV_ALG_PRESENT))
+        LOG_TEST_RET(card->ctx, SC_ERROR_INVALID_ARGUMENTS, "must specify an algorithm");
+
+    switch (env->algorithm) {
+    case SC_ALGORITHM_RSA:
+    case SC_ALGORITHM_DES:
+        /* ok */
+        break;
+    default:
+        LOG_TEST_RET(card->ctx, SC_ERROR_NOT_SUPPORTED, "unsupported security algorithm");
+    }
+
+    priv->sec_env = *env;
+    priv->sec_env_num = se_num;
+    return SC_SUCCESS;
+}
+
+static int dkccos_restore_security_env(sc_card_t *card, int se_num)
+{
+    struct dkccos_private_data *priv = card->drv_data;
+
+    if (priv->sec_env_num != se_num)
+        return SC_SUCCESS;
+
+    priv->sec_env_num = -1;
+    return SC_SUCCESS;
+}
+
+static int dkccos_do_crypto(sc_card_t *card, unsigned op, const u8 *in, size_t inlen, u8 *out, size_t outlen)
+{
+    int r = 0;
+    sc_apdu_t apdu;
+    enum dkccos_cipher cipher;
+    unsigned char buf[SC_MAX_APDU_BUFFER_SIZE];
+    struct dkccos_private_data *priv = card->drv_data;
+
+    if (priv->sec_env_num < 0)
+        LOG_FUNC_RETURN(card->ctx, SC_ERROR_SECURITY_STATUS_NOT_SATISFIED);
+
+    switch (priv->sec_env.algorithm) {
+    case SC_ALGORITHM_RSA:
+        if (priv->sec_env.algorithm_flags & SC_ALGORITHM_RSA_PAD_PKCS1)
+            cipher = DKCCOS_CIPHER_RSA_PKCS1;
+        else
+            cipher = DKCCOS_CIPHER_RSA_RAW;
+        break;
+    case SC_ALGORITHM_DES:
+        cipher = DKCCOS_CIPHER_DES_ECB;
+        break;
+    default:
+        LOG_FUNC_RETURN(card->ctx, SC_ERROR_NOT_SUPPORTED);
+    }
+
+    sc_format_apdu(card, &apdu, SC_APDU_CASE_4, op, cipher, 0);
+
+    r = dkccos_do_format_path(card, &buf[0], 4, &priv->sec_env.file_ref);
+    LOG_TEST_RET(card->ctx, r, "file ID does not fit in command buffer");
+    buf[4] = inlen >> 8;
+    buf[5] = inlen & 0xff;
+    memcpy(buf + 6, in, inlen);
+    apdu.data = buf;
+    apdu.datalen = apdu.lc = inlen + 6;
+    apdu.resp = out;
+    apdu.resplen = apdu.le = outlen;
+
+    r = sc_transmit_apdu(card, &apdu);
+    LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+    return sc_check_sw(card, apdu.sw1, apdu.sw2);
+}
+
+static int dkccos_decipher(sc_card_t *card, const u8 *crgram, size_t crgram_len, u8 *out, size_t outlen)
+{
+    int r = dkccos_do_crypto(card, DKCCOS_INS_DECRYPT, crgram, crgram_len, out, outlen);
+    LOG_TEST_RET(card->ctx, r, "DECRYPT failed");
+    return r;
+}
+
+static int dkccos_compute_signature(struct sc_card *card, const u8 *data, size_t data_len, u8 *out, size_t outlen)
+{
+    int r = dkccos_do_crypto(card, DKCCOS_INS_SIGN, data, data_len, out, outlen);
+    LOG_TEST_RET(card->ctx, r, "SIGN failed");
+    return r;
+}
+
+
 static int dkccos_construct_acl(struct sc_card *card, const sc_file_t *file, const sc_acl_entry_t *entry)
 {
     unsigned char c = 0;
@@ -361,7 +524,11 @@ static int dkccos_construct_fci(struct sc_card *card, const sc_file_t *file, u8 
     const sc_acl_entry_t *entry;
     unsigned int type, structure;
 
-    structure = DKCCOS_STRUCTURE_NORMAL;
+    if (file->prop_attr && file->prop_attr_len) {
+        structure = file->prop_attr[0];
+    } else {
+        structure = DKCCOS_STRUCTURE_NORMAL;
+    }
     switch (file->type) {
     case SC_FILE_TYPE_INTERNAL_EF:
         type = DKCCOS_FILE_INTERNAL;
@@ -450,10 +617,9 @@ static int dkccos_process_fci(sc_card_t *card, sc_file_t *file, const u8 *data, 
         file->ef_structure = SC_FILE_EF_TRANSPARENT;
         break;
     case DKCCOS_STRUCTURE_PUBKEY:
-        file->ef_structure = SC_FILE_EF_TRANSPARENT;
-        break;
     case DKCCOS_STRUCTURE_PRIVKEY:
-        file->ef_structure = SC_FILE_EF_TRANSPARENT;
+        file->ef_structure = SC_FILE_EF_UNKNOWN;
+        sc_file_set_prop_attr(file, &data[5], 1);
         break;
     default:
         LOG_TEST_RET(card->ctx, SC_ERROR_INCORRECT_PARAMETERS, "invalid file structure");
@@ -467,26 +633,6 @@ static int dkccos_process_fci(sc_card_t *card, sc_file_t *file, const u8 *data, 
     LOG_TEST_RET(card->ctx, r, "card delete ACL conversion failed");
 
     return 0;
-}
-
-
-static int dkccos_erase_card(sc_card_t *card)
-{
-    int r = 0;
-    sc_apdu_t apdu;
-    u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
-
-    sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, DKCCOS_INS_RECYCLE, 0x6B, 0x2C);
-    apdu.resp = rbuf;
-    apdu.resplen = sizeof(rbuf);
-    apdu.le = 264;
-
-    r = sc_transmit_apdu(card, &apdu);
-    LOG_TEST_RET(card->ctx, r, "card format command failed");
-    r = sc_check_sw(card, apdu.sw1, apdu.sw2);
-    LOG_TEST_RET(card->ctx, r, "ERASE failed");
-
-    return r;
 }
 
 
@@ -517,11 +663,72 @@ static int dkccos_list_files(sc_card_t *card, u8 *buf, size_t buflen)
     return idx * 2;
 }
 
+
+static int dkccos_erase_card(sc_card_t *card)
+{
+    int r = 0;
+    sc_apdu_t apdu;
+    u8 rbuf[SC_MAX_APDU_BUFFER_SIZE];
+
+    sc_format_apdu(card, &apdu, SC_APDU_CASE_2_SHORT, DKCCOS_INS_RECYCLE, 0x6B, 0x2C);
+    apdu.resp = rbuf;
+    apdu.resplen = sizeof(rbuf);
+    apdu.le = 264;
+
+    r = sc_transmit_apdu(card, &apdu);
+    LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+    r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+    LOG_TEST_RET(card->ctx, r, "ERASE failed");
+
+    return r;
+}
+
+static int dkccos_generate_key(sc_card_t *card, struct sc_cardctl_dkccos_genkey_info *params)
+{
+    int r = 0;
+    sc_apdu_t apdu;
+    unsigned char buf[SC_MAX_APDU_BUFFER_SIZE];
+
+    switch (params->key_type) {
+    case SC_CARDCTL_DKCCOS_KEY_TYPE_RSA:
+        switch (params->key_size) {
+            case 512:
+            case 768:
+            case 1024:
+            case 2048:
+                /* ok */
+                break;
+            default:
+                LOG_FUNC_RETURN(card->ctx, SC_ERROR_WRONG_LENGTH);
+        }
+        break;
+    default:
+        LOG_FUNC_RETURN(card->ctx, SC_ERROR_INVALID_ARGUMENTS);
+    }
+
+    sc_format_apdu(card, &apdu, SC_APDU_CASE_3_SHORT, DKCCOS_INS_GENERATE_KEYS, 0x0D, 0x33);
+    r = dkccos_do_format_path_id(card, &buf[0], 4, params->id_prv);
+    LOG_TEST_RET(card->ctx, r, "private key ID does not fit in command buffer");
+    r = dkccos_do_format_path_id(card, &buf[4], 4, params->id_pub);
+    LOG_TEST_RET(card->ctx, r, "public key ID does not in command buffer");
+    apdu.lc = apdu.datalen = 8;
+    apdu.data = buf;
+
+    r = sc_transmit_apdu(card, &apdu);
+    LOG_TEST_RET(card->ctx, r, "APDU transmit failed");
+    r = sc_check_sw(card, apdu.sw1, apdu.sw2);
+    LOG_TEST_RET(card->ctx, r, "GENERATE KEY failed");
+
+    return r;
+}
+
 static int dkccos_card_ctl(sc_card_t *card, unsigned long cmd, void *ptr)
 {
     switch (cmd) {
     case SC_CARDCTL_ERASE_CARD:
         return dkccos_erase_card(card);
+    case SC_CARDCTL_DKCCOS_GENERATE_KEY:
+        return dkccos_generate_key(card, (struct sc_cardctl_dkccos_genkey_info *)ptr);
     }
     return SC_ERROR_NOT_SUPPORTED;
 }
@@ -558,6 +765,11 @@ static struct sc_card_driver *sc_get_driver(void)
 
     /* ISO 7816-8 functions */
     dkccos_ops.logout = dkccos_logout;
+    dkccos_ops.set_security_env = dkccos_set_security_env;
+    dkccos_ops.restore_security_env = dkccos_restore_security_env;
+    dkccos_ops.decipher = dkccos_decipher;
+    dkccos_ops.compute_signature = dkccos_compute_signature;
+    /* verify, change_reference_data, reset_retry_counter replaced by pin_cmd */
 
     /* ISO 7816-9 functions */
     dkccos_ops.delete_record = NULL;

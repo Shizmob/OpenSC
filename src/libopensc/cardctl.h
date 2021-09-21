@@ -302,6 +302,11 @@ enum {
 	SC_CARDCTL_IDPRIME_FINAL_GET_OBJECTS,
 	SC_CARDCTL_IDPRIME_GET_TOKEN_NAME,
 
+	/*
+	 * DKCCOS specific calls
+	 */
+	SC_CARDCTL_DKCCOS_BASE = _CTL_PREFIX('D', 'K', 'C'),
+	SC_CARDCTL_DKCCOS_GENERATE_KEY,
 };
 
 enum {
@@ -1120,6 +1125,22 @@ typedef struct sc_cardctl_coolkey_find_object {
 
 #define SC_CARDCTL_COOLKEY_FIND_BY_ID       0
 #define SC_CARDCTL_COOLKEY_FIND_BY_TEMPLATE 1
+
+/*
+ * DKCCOS
+ */
+
+enum sc_cardctl_dkccos_key_type {
+	SC_CARDCTL_DKCCOS_KEY_TYPE_RSA = 1,
+};
+
+struct sc_cardctl_dkccos_genkey_info {
+	enum sc_cardctl_dkccos_key_type key_type;
+	unsigned int    id_prv, id_pub;
+	unsigned int    key_size;
+	unsigned char * pubkey;
+	unsigned int    pubkey_len;
+};
 
 #ifdef __cplusplus
 }
